@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 
 class WrappedPlayer {
+  final String playerId;
   double pausedAt;
   double currentVolume = 1.0;
   ReleaseMode currentReleaseMode = ReleaseMode.RELEASE;
@@ -13,6 +14,14 @@ class WrappedPlayer {
   bool isPlaying = false;
 
   AudioElement player;
+
+  WrappedPlayer(this.playerId);
+
+  Stream<Duration> get positionChanged => player.onTimeUpdate.map(
+      (event) => Duration(milliseconds: (player.currentTime * 1000).toInt()));
+
+  Stream<MediaError> get errorStream =>
+      player.onError.map((event) => player.error);
 
   void setUrl(String url) {
     currentUrl = url;
@@ -24,9 +33,44 @@ class WrappedPlayer {
     }
   }
 
+  Future<void> ensureReadyToPlay() async {
+    var completer = Completer();
+    var subError = player.onError.listen((error) {
+      completer.completeError(Exception(player.error.message));
+    });
+    var sub = player.onCanPlayThrough.listen((event) {
+      completer.complete();
+    });
+    try {
+      await completer.future;
+    } finally {
+      sub?.cancel();
+      subError?.cancel();
+    }
+  }
+
   void setVolume(double volume) {
     currentVolume = volume;
     player?.volume = volume;
+  }
+
+  double getCurrentPosition() {
+    return player?.currentTime;
+  }
+
+  num getDuration() {
+    var duration = player?.duration;
+    if (duration == null ||
+        duration == double.nan ||
+        duration.toString() == 'NaN') {
+      return 0;
+    }
+    return duration;
+  }
+
+  void seek(double position) {
+    pausedAt = pausedAt != 0 ? position : 0;
+    player?.currentTime = position;
   }
 
   void recreateNode() {
@@ -86,8 +130,16 @@ class WrappedPlayer {
 }
 
 class AudioplayersPlugin {
+  final MethodChannel channel;
+
   // players by playerId
   Map<String, WrappedPlayer> players = {};
+
+  StreamSubscription<Duration> _subPosition;
+
+  StreamSubscription<MediaError> _subErrors;
+
+  AudioplayersPlugin(this.channel);
 
   static void registerWith(Registrar registrar) {
     final MethodChannel channel = MethodChannel(
@@ -96,12 +148,12 @@ class AudioplayersPlugin {
       registrar.messenger,
     );
 
-    final AudioplayersPlugin instance = AudioplayersPlugin();
+    final AudioplayersPlugin instance = AudioplayersPlugin(channel);
     channel.setMethodCallHandler(instance.handleMethodCall);
   }
 
   WrappedPlayer getOrCreatePlayer(String playerId) {
-    return players.putIfAbsent(playerId, () => WrappedPlayer());
+    return players.putIfAbsent(playerId, () => WrappedPlayer(playerId));
   }
 
   Future<WrappedPlayer> setUrl(String playerId, String url) async {
@@ -111,7 +163,13 @@ class AudioplayersPlugin {
       return player;
     }
 
-    player.setUrl(url);
+    try {
+      player.setUrl(url);
+      registerStreams(player);
+      await player.ensureReadyToPlay();
+    } catch (ex) {
+      throw Exception('Error during player initialization: $ex');
+    }
     return player;
   }
 
@@ -166,6 +224,17 @@ class AudioplayersPlugin {
           getOrCreatePlayer(playerId).setVolume(volume);
           return 1;
         }
+      case 'getDuration':
+        {
+          final durationInSec = getOrCreatePlayer(playerId).getDuration();
+          return (durationInSec * 1000).toInt();
+        }
+      case 'getCurrentPosition':
+        {
+          final positionInSec =
+              getOrCreatePlayer(playerId).getCurrentPosition();
+          return (positionInSec * 1000).toInt();
+        }
       case 'setReleaseMode':
         {
           ReleaseMode releaseMode =
@@ -179,6 +248,9 @@ class AudioplayersPlugin {
           return 1;
         }
       case 'seek':
+        double position = call.arguments['position'] ?? 0.0;
+        getOrCreatePlayer(playerId).seek(position / 1000);
+        return 1;
       case 'setPlaybackRate':
       default:
         throw PlatformException(
@@ -187,5 +259,23 @@ class AudioplayersPlugin {
               "The audioplayers plugin for web doesn't implement the method '$method'",
         );
     }
+  }
+
+  void registerStreams(WrappedPlayer player) {
+    _subPosition?.cancel();
+    _subPosition = player.positionChanged.listen((duration) {
+      channel.invokeMethod('audio.onCurrentPosition',
+          buildArguments(duration.inMilliseconds, player));
+    });
+
+    _subErrors?.cancel();
+    _subErrors = player.errorStream.listen((mediaError) {
+      channel.invokeMethod(
+          'audio.onError', buildArguments(mediaError.message, player));
+    });
+  }
+
+  Map<String, Object> buildArguments(Object value, WrappedPlayer player) {
+    return {'value': value, 'playerId': player.playerId};
   }
 }
